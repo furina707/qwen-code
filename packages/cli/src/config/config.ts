@@ -1219,7 +1219,8 @@ function resolveMaxToolCalls(argv: CliArgs, settings: Settings): number {
  *     "authType": "openai",
  *     "model": "qwen3.6-plus",
  *     "openaiApiKey": "sk-...",
- *     "openaiBaseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1"
+ *     "openaiBaseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+ *     "yolo": true
  *   }
  */
 export function loadDefaultConfig(): {
@@ -1227,6 +1228,7 @@ export function loadDefaultConfig(): {
   model?: string;
   openaiApiKey?: string;
   openaiBaseUrl?: string;
+  yolo?: boolean;
 } {
   const configPath = path.join(homedir(), '.qwen', 'default-config.json');
   try {
@@ -1250,6 +1252,7 @@ export function loadDefaultConfig(): {
         typeof parsed.openaiBaseUrl === 'string'
           ? parsed.openaiBaseUrl
           : undefined,
+      yolo: parsed.yolo === true,
     };
   } catch {
     return {};
@@ -1426,6 +1429,11 @@ export async function loadCliConfig(
   const debugMode = isDebugMode(argv);
   const bareMode = isBareMode(argv.bare);
 
+  // Load default config from ~/.qwen/default-config.json if present.
+  // Used to skip the interactive provider-selection screen and apply
+  // default flags (yolo) on every launch. CLI args still take precedence.
+  const defaultConfig = loadDefaultConfig();
+
   // Set runtime output directory from settings (env var QWEN_RUNTIME_DIR
   // is auto-detected inside getRuntimeBaseDir() at each call site).
   // Pass cwd so that relative paths like ".qwen" resolve per-project.
@@ -1500,7 +1508,7 @@ export async function loadCliConfig(
   let approvalMode: ApprovalMode;
   if (argv.approvalMode) {
     approvalMode = parseApprovalModeValue(argv.approvalMode);
-  } else if (argv.yolo) {
+  } else if (argv.yolo || defaultConfig.yolo) {
     approvalMode = ApprovalMode.YOLO;
   } else if (!bareMode && settings.tools?.approvalMode) {
     approvalMode = parseApprovalModeValue(settings.tools.approvalMode);
@@ -1714,11 +1722,6 @@ export async function loadCliConfig(
       ? new Set(settings.mcp.excluded.filter(Boolean))
       : undefined;
   }
-
-  // Load default config from ~/.qwen/default-config.json if present.
-  // Used to skip the interactive provider-selection screen by baking
-  // an API key, base URL, and model into the user's home directory.
-  const defaultConfig = loadDefaultConfig();
 
   const selectedAuthType =
     (argv.authType as AuthType | undefined) ||
