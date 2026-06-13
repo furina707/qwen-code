@@ -109,6 +109,7 @@ import {
 } from '../utils/partUtils.js';
 import { promptIdContext } from '../utils/promptIdContext.js';
 import { retryWithBackoff, isUnattendedMode } from '../utils/retry.js';
+import { getErrorStatus } from '../utils/errors.js';
 import { subagentNameContext } from '../utils/subagentNameContext.js';
 import { escapeSystemReminderTags } from '../utils/xml.js';
 import { ApiRetryEvent } from '../telemetry/types.js';
@@ -321,10 +322,7 @@ export class GeminiClient {
     this.initializedSessionId = sessionId;
 
     // Clean up stale tool result files from previous sessions (fire-and-forget)
-    void cleanupOldToolResults(
-      Storage.getGlobalTempDir(),
-      24 * 60 * 60 * 1000,
-    );
+    void cleanupOldToolResults(Storage.getGlobalTempDir(), 24 * 60 * 60 * 1000);
   }
 
   /**
@@ -658,10 +656,7 @@ export class GeminiClient {
     debugLogger.debug('[FILE_READ_CACHE] clear after resetChat');
     this.config.getFileReadCache().clear();
     // Clean up old tool result overflow files on /clear
-    void cleanupOldToolResults(
-      Storage.getGlobalTempDir(),
-      24 * 60 * 60 * 1000,
-    );
+    void cleanupOldToolResults(Storage.getGlobalTempDir(), 24 * 60 * 60 * 1000);
     this.config.getBaseLlmClient().clearPerModelGeneratorCache();
     // Abort any in-flight auto-memory recall so the stale controller
     // does not leak into the next session.
@@ -2534,6 +2529,27 @@ export class GeminiClient {
       if (abortSignal.aborted) {
         throw error;
       }
+
+      const errorStatus = getErrorStatus(error);
+      const shouldSwitchModel =
+        errorStatus === 429 ||
+        errorStatus === 530 ||
+        (errorStatus !== undefined && errorStatus >= 500);
+
+      if (shouldSwitchModel) {
+        const switched = await this.trySwitchToNextModel();
+        if (switched) {
+          // Retry with the new model
+          return this.generateContent(
+            contents,
+            generationConfig,
+            abortSignal,
+            this.config.getModel(),
+            promptId,
+          );
+        }
+      }
+
       await reportError(
         error,
         `Error generating content via API with model ${currentAttemptModel}.`,
@@ -2546,6 +2562,51 @@ export class GeminiClient {
       throw new Error(
         `Failed to generate content with model ${currentAttemptModel}: ${getErrorMessage(error)}`,
       );
+    }
+  }
+
+  /**
+   * Attempt to switch to the next available model in the priority list.
+   * Returns true if a switch was successful, false if no more models are available.
+   */
+  private async trySwitchToNextModel(): Promise<boolean> {
+    const modelsConfig = this.config.getModelsConfig();
+    const availableModels = modelsConfig.getAllConfiguredModels();
+    const currentModel = this.config.getModel();
+    const currentAuthType = modelsConfig.getCurrentAuthType();
+
+    if (availableModels.length <= 1) {
+      return false;
+    }
+
+    // Find current model index
+    const currentIndex = availableModels.findIndex(
+      (m) => m.id === currentModel && m.authType === currentAuthType,
+    );
+
+    // Try next model in the list
+    const nextIndex = (currentIndex + 1) % availableModels.length;
+    const nextModel = availableModels[nextIndex];
+
+    if (!nextModel || nextModel.id === currentModel) {
+      return false;
+    }
+
+    try {
+      debugLogger.warn(
+        `[ModelSwitch] Current model ${currentModel} failed, switching to ${nextModel.id}`,
+      );
+      process.stderr.write(
+        `[qwen-code] Model ${currentModel} failed, auto-switching to ${nextModel.id}\n`,
+      );
+      await this.config.switchModel(nextModel.authType, nextModel.id);
+      return true;
+    } catch (err) {
+      debugLogger.error(
+        `[ModelSwitch] Failed to switch to ${nextModel.id}:`,
+        err,
+      );
+      return false;
     }
   }
 
