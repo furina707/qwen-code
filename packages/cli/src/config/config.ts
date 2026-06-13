@@ -1207,6 +1207,55 @@ function resolveMaxToolCalls(argv: CliArgs, settings: Settings): number {
   return -1;
 }
 
+/**
+ * Default config file location: ~/.qwen/default-config.json
+ *
+ * Skips the interactive provider-selection screen by pre-populating
+ * auth type, model, API key, and base URL on every launch. CLI args
+ * still take precedence.
+ *
+ * Example file:
+ *   {
+ *     "authType": "openai",
+ *     "model": "qwen3.6-plus",
+ *     "openaiApiKey": "sk-...",
+ *     "openaiBaseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1"
+ *   }
+ */
+export function loadDefaultConfig(): {
+  authType?: string;
+  model?: string;
+  openaiApiKey?: string;
+  openaiBaseUrl?: string;
+} {
+  const configPath = path.join(homedir(), '.qwen', 'default-config.json');
+  try {
+    if (!fs.existsSync(configPath)) {
+      return {};
+    }
+    const raw = fs.readFileSync(configPath, 'utf-8');
+    const parsed = JSON.parse(raw);
+    if (typeof parsed !== 'object' || parsed === null) {
+      return {};
+    }
+    return {
+      authType:
+        typeof parsed.authType === 'string' ? parsed.authType : undefined,
+      model: typeof parsed.model === 'string' ? parsed.model : undefined,
+      openaiApiKey:
+        typeof parsed.openaiApiKey === 'string'
+          ? parsed.openaiApiKey
+          : undefined,
+      openaiBaseUrl:
+        typeof parsed.openaiBaseUrl === 'string'
+          ? parsed.openaiBaseUrl
+          : undefined,
+    };
+  } catch {
+    return {};
+  }
+}
+
 export function isDebugMode(argv: CliArgs): boolean {
   if (argv.debug) return true;
   const debugVal = process.env['DEBUG'];
@@ -1666,8 +1715,14 @@ export async function loadCliConfig(
       : undefined;
   }
 
+  // Load default config from ~/.qwen/default-config.json if present.
+  // Used to skip the interactive provider-selection screen by baking
+  // an API key, base URL, and model into the user's home directory.
+  const defaultConfig = loadDefaultConfig();
+
   const selectedAuthType =
     (argv.authType as AuthType | undefined) ||
+    (defaultConfig.authType as AuthType | undefined) ||
     (bareMode ? undefined : settings.security?.auth?.selectedType) ||
     /* getAuthTypeFromEnv means no authType was explicitly provided, we infer the authType from env vars */
     getAuthTypeFromEnv();
@@ -1675,9 +1730,9 @@ export async function loadCliConfig(
   // Unified resolution of generation config with source attribution
   const resolvedCliConfig = resolveCliGenerationConfig({
     argv: {
-      model: argv.model,
-      openaiApiKey: argv.openaiApiKey,
-      openaiBaseUrl: argv.openaiBaseUrl,
+      model: argv.model ?? defaultConfig.model,
+      openaiApiKey: argv.openaiApiKey ?? defaultConfig.openaiApiKey,
+      openaiBaseUrl: argv.openaiBaseUrl ?? defaultConfig.openaiBaseUrl,
       openaiLogging: argv.openaiLogging,
       openaiLoggingDir: argv.openaiLoggingDir,
     },
