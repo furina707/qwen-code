@@ -347,6 +347,8 @@ export const useGeminiStream = (
   const lastPromptErroredRef = useRef(false);
   const dualOutput = useDualOutput();
   const [isResponding, setIsResponding] = useState<boolean>(false);
+  // React state can lag by one render; this tracks the actual stream lifetime.
+  const activeModelStreamsRef = useRef(0);
   const [thought, setThought] = useState<ThoughtSummary | null>(null);
   // Hold the latest history in a ref so handleCompletedTools can read it
   // without depending on `history` (which would recreate the tool scheduler
@@ -1533,6 +1535,7 @@ export const useGeminiStream = (
               break;
             case ServerGeminiEventType.UserCancelled:
               flushBufferedStreamEvents();
+              toolCallRequests.length = 0;
               handleUserCancelledEvent(userMessageTimestamp);
               break;
             case ServerGeminiEventType.Error:
@@ -1661,7 +1664,7 @@ export const useGeminiStream = (
         flushBufferedStreamEventsRef.current.delete(flushBufferedStreamEvents);
       }
       dualOutput?.finalizeAssistantMessage();
-      if (toolCallRequests.length > 0) {
+      if (toolCallRequests.length > 0 && !signal.aborted) {
         scheduleToolCalls(toolCallRequests, signal);
       }
       return StreamProcessingStatus.Completed;
@@ -1855,6 +1858,7 @@ export const useGeminiStream = (
           logUserRetry(config, new UserRetryEvent(prompt_id));
         }
 
+        activeModelStreamsRef.current += 1;
         setIsResponding(true);
         setInitError(null);
         // Entering "requesting" phase — no content yet for this API call.
@@ -1969,7 +1973,13 @@ export const useGeminiStream = (
           }
         } finally {
           submitPromptOnCompleteRef.current = null;
-          setIsResponding(false);
+          activeModelStreamsRef.current = Math.max(
+            0,
+            activeModelStreamsRef.current - 1,
+          );
+          if (activeModelStreamsRef.current === 0) {
+            setIsResponding(false);
+          }
           isSubmittingQueryRef.current = false;
         }
       });
@@ -2114,14 +2124,14 @@ export const useGeminiStream = (
           },
         );
 
-      // History-based dedup MUST run before the `isResponding` early-return.
+      // History-based dedup MUST run before the active-stream early-return.
       // If a synthetic `functionResponse` for this callId is already in
       // chat.history (planted on session-load by
       // `client.repairOrphanedToolUseTurnsInHistory` or on every
       // `chat.sendMessageStream` push by the inline repair pass), the
       // in-flight scheduler result must be marked submitted NOW —
       // `useReactToolScheduler.allToolCallsCompleteHandler` is single-shot
-      // per batch, so a later isResponding=true early-return would leave
+      // per batch, so a later active-stream early-return would leave
       // the tool stuck in `completed-but-not-submitted` forever (Race A
       // surfaced in PR #4176 review). The real result is dropped on the
       // wire — same trade-off upstream Claude Code makes when its
@@ -2182,7 +2192,7 @@ export const useGeminiStream = (
         markToolsAsSubmitted(dedupedCallIds);
       }
 
-      if (isResponding) {
+      if (activeModelStreamsRef.current > 0) {
         return;
       }
 
@@ -2231,6 +2241,16 @@ export const useGeminiStream = (
       }
 
       if (geminiTools.length === 0) {
+        return;
+      }
+
+      if (
+        turnCancelledRef.current ||
+        abortControllerRef.current?.signal.aborted
+      ) {
+        markToolsAsSubmitted(
+          geminiTools.map((toolCall) => toolCall.request.callId),
+        );
         return;
       }
 
@@ -2409,7 +2429,6 @@ export const useGeminiStream = (
       submitQuery(responsesToSend, SendMessageType.ToolResult, prompt_ids[0]);
     },
     [
-      isResponding,
       submitQuery,
       markToolsAsSubmitted,
       geminiClient,

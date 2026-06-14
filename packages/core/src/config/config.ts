@@ -988,8 +988,12 @@ function loadMemoryPressureConfig(): MemoryPressureConfig {
       config.criticalRatio,
     );
 
-    if (process.env['QWEN_MEMORY_ENABLE_GC'] === '1') {
-      config.enableExplicitGC = true;
+    const enableGC = process.env['QWEN_MEMORY_ENABLE_GC'];
+    if (
+      enableGC &&
+      ['0', 'false', 'off', 'no'].includes(enableGC.trim().toLowerCase())
+    ) {
+      config.enableExplicitGC = false;
     }
 
     validateMemoryPressureConfig(config);
@@ -2286,11 +2290,15 @@ export class Config {
     sessionData?: ResumedSessionData,
   ): string {
     // Finalize the outgoing session before switching.
+    const outgoingChatRecordingService = this.chatRecordingService;
     try {
-      this.chatRecordingService?.finalize();
+      outgoingChatRecordingService?.finalize();
     } catch {
       // Best-effort — don't block session switch
     }
+    void outgoingChatRecordingService?.flush().catch(() => {
+      // Best-effort — don't block session switch
+    });
 
     const previousSessionId = this.sessionId;
     this.sessionId = sessionId ?? randomUUID();
@@ -3887,15 +3895,20 @@ export class Config {
 
   getFileHistoryService(): FileHistoryService {
     if (!this.fileHistoryService) {
-      this.fileHistoryService = new FileHistoryService(
+      const service = new FileHistoryService(
         this.sessionId,
         this.fileCheckpointingEnabled,
         this.cwd,
+        (snapshot) => {
+          if (this.fileHistoryService !== service) return;
+          this.getChatRecordingService()?.recordFileHistorySnapshot(snapshot);
+        },
       );
+      this.fileHistoryService = service;
       const snapshots = this.sessionData?.fileHistorySnapshots;
-      if (snapshots?.length && this.fileHistoryService.isEnabled()) {
-        this.fileHistoryService.restoreFromSnapshots(snapshots);
-        void this.fileHistoryService.validateRestoredSnapshots().catch((e) => {
+      if (snapshots?.length && service.isEnabled()) {
+        service.restoreFromSnapshots(snapshots);
+        void service.validateRestoredSnapshots().catch((e) => {
           this.debugLogger.error(
             `FileHistory: validateRestoredSnapshots failed: ${e}`,
           );

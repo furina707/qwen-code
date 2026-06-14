@@ -73,6 +73,7 @@ import {
   clearActiveGoal,
   setActiveGoal,
 } from '../goals/activeGoalStore.js';
+import type { FileHistorySnapshot } from '../services/fileHistoryService.js';
 
 // Mock fs module to prevent actual file system operations during tests
 const mockFileSystem = new Map<string, string>();
@@ -367,6 +368,12 @@ describe('Gemini Client (client.ts)', () => {
   let mockConfig: Config;
   let client: GeminiClient;
   let mockGenerateContentFn: Mock;
+  let mockFileHistoryService: {
+    makeSnapshot: ReturnType<typeof vi.fn>;
+    getSnapshots: ReturnType<typeof vi.fn>;
+    restoreFromSnapshots: ReturnType<typeof vi.fn>;
+    rewind: ReturnType<typeof vi.fn>;
+  };
   let mockMemoryManager: {
     scheduleExtract: ReturnType<typeof vi.fn>;
     scheduleDream: ReturnType<typeof vi.fn>;
@@ -406,6 +413,12 @@ describe('Gemini Client (client.ts)', () => {
     mockGenerateContentFn = vi.fn().mockResolvedValue({
       candidates: [{ content: { parts: [{ text: '{"key": "value"}' }] } }],
     });
+    mockFileHistoryService = {
+      makeSnapshot: vi.fn().mockResolvedValue(undefined),
+      getSnapshots: vi.fn().mockReturnValue([]),
+      restoreFromSnapshots: vi.fn(),
+      rewind: vi.fn(),
+    };
 
     // Disable 429 simulation for tests
     setSimulate429(false);
@@ -491,6 +504,7 @@ describe('Gemini Client (client.ts)', () => {
       getBaseLlmClient: vi.fn(),
       getSkipLoopDetection: vi.fn().mockReturnValue(false),
       getChatRecordingService: vi.fn().mockReturnValue(undefined),
+      getFileHistoryService: vi.fn().mockReturnValue(mockFileHistoryService),
       getResumedSessionData: vi.fn().mockReturnValue(undefined),
       getArenaAgentClient: vi.fn().mockReturnValue(null),
       getManagedAutoMemoryEnabled: vi.fn().mockReturnValue(true),
@@ -6635,6 +6649,103 @@ Other open files:
         expect(recordAttributionSnapshot).not.toHaveBeenCalled();
       });
     });
+
+    describe('file history snapshot persistence', () => {
+      let recordFileHistorySnapshot: ReturnType<typeof vi.fn>;
+      const latestSnapshot: FileHistorySnapshot = {
+        promptId: 'prompt-uq',
+        timestamp: new Date('2026-06-13T00:00:00.000Z'),
+        trackedFileBackups: {
+          'a.txt': {
+            backupFileName: 'backup-a',
+            version: 1,
+            backupTime: new Date('2026-06-13T00:00:01.000Z'),
+          },
+        },
+      };
+
+      beforeEach(() => {
+        recordFileHistorySnapshot = vi.fn();
+        mockFileHistoryService.makeSnapshot.mockResolvedValue(undefined);
+        mockFileHistoryService.getSnapshots.mockReturnValue([latestSnapshot]);
+        vi.mocked(mockConfig.getChatRecordingService).mockReturnValue({
+          recordAttributionSnapshot: vi.fn(),
+          recordFileHistorySnapshot,
+          recordUserMessage: vi.fn(),
+          recordCronPrompt: vi.fn(),
+        } as unknown as ReturnType<Config['getChatRecordingService']>);
+
+        mockTurnRunFn.mockReturnValue(
+          (async function* () {
+            yield { type: GeminiEventType.Content, value: 'ok' };
+          })(),
+        );
+      });
+
+      async function collectStream(
+        messageType: SendMessageType,
+        promptId = 'prompt-uq',
+      ): Promise<ServerGeminiStreamEvent[]> {
+        const stream = client.sendMessageStream(
+          [{ text: 'user' }],
+          new AbortController().signal,
+          promptId,
+          { type: messageType },
+        );
+        const chunks: ServerGeminiStreamEvent[] = [];
+        for await (const chunk of stream) {
+          chunks.push(chunk);
+        }
+        return chunks;
+      }
+
+      it('calls makeSnapshot for UserQuery turns', async () => {
+        await collectStream(SendMessageType.UserQuery, 'prompt-file-history');
+
+        expect(mockFileHistoryService.makeSnapshot).toHaveBeenCalledWith(
+          'prompt-file-history',
+        );
+      });
+
+      it('records the latest snapshot after a UserQuery snapshot', async () => {
+        await collectStream(SendMessageType.UserQuery);
+
+        expect(recordFileHistorySnapshot).toHaveBeenCalledWith(latestSnapshot);
+      });
+
+      it('does not call makeSnapshot for ToolResult and Retry turns', async () => {
+        await collectStream(SendMessageType.ToolResult, 'prompt-tool-result');
+        await collectStream(SendMessageType.Retry, 'prompt-retry');
+
+        expect(mockFileHistoryService.makeSnapshot).not.toHaveBeenCalled();
+      });
+
+      it('swallows makeSnapshot rejection and still yields content', async () => {
+        mockFileHistoryService.makeSnapshot.mockRejectedValueOnce(
+          new Error('snapshot failed'),
+        );
+
+        const chunks = await collectStream(SendMessageType.UserQuery);
+
+        expect(chunks).toContainEqual({
+          type: GeminiEventType.Content,
+          value: 'ok',
+        });
+      });
+
+      it('swallows recordFileHistorySnapshot errors and still yields content', async () => {
+        recordFileHistorySnapshot.mockImplementationOnce(() => {
+          throw new Error('record failed');
+        });
+
+        const chunks = await collectStream(SendMessageType.UserQuery);
+
+        expect(chunks).toContainEqual({
+          type: GeminiEventType.Content,
+          value: 'ok',
+        });
+      });
+    });
   });
 
   describe('generateContent', () => {
@@ -6661,6 +6772,25 @@ Other open files:
           contents,
         }),
         'test-session-id',
+      );
+    });
+
+    it('forwards configured retryErrorCodes to retryWithBackoff', async () => {
+      vi.mocked(mockConfig.getContentGeneratorConfig).mockReturnValue({
+        authType: AuthType.USE_OPENAI,
+        retryErrorCodes: [4999],
+      } as unknown as ContentGeneratorConfig);
+
+      await client.generateContent(
+        [{ role: 'user', parts: [{ text: 'hi' }] }],
+        {},
+        new AbortController().signal,
+        client['config'].getModel(),
+      );
+
+      expect(retryWithBackoff).toHaveBeenCalledWith(
+        expect.any(Function),
+        expect.objectContaining({ extraRetryErrorCodes: [4999] }),
       );
     });
 
